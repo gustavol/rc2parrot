@@ -20,23 +20,24 @@ constexpr int CH_KILL = 5;  // switch: high = cut motors
 constexpr int CH_TRIM = 6;  // switch or button: rising edge = flat trim (landed only)
 
 // ---------- Sticks and switches ----------
-constexpr int SWITCH_US = 1700;   // switch is "high" above this pulse width
+constexpr int SWITCH_US = 1250;   // switch is "high" above this; the radio switches give 1000 (off) and 1500 (on)
 constexpr int DEADBAND = 5;       // stick center deadband, in %
 constexpr int DEADBAND_GAZ = 12;  // the throttle stick has no spring, so it gets a wider center
-// No rate limits here: the drone runs at its maximum and the radio limits (dual rates, expo).
+// Throttle and yaw command a speed: those drone limits stay at maximum and the radio limits them.
+// Roll and pitch command a tilt angle, which is acceleration: the speed keeps growing while the
+// stick is off center, so the drone itself must cap the angle. 0 = drone maximum.
+constexpr float MAX_TILT_DEG = 10;
 
 // ---------- Timing ----------
 constexpr uint32_t PPM_TIMEOUT_MS = 300;  // no PPM for this long = failsafe landing
-// With PPM, a PCMD goes out on every frame (~22.5 ms). Without a new frame, it repeats at this period.
-// Parrot SDK (libARDiscovery, BLE network config): 50 ms loop, at least 20 ms between sends.
+// One PCMD per period, with the newest radio value. The Parrot app sends at 50 ms. Sending on every
+// PPM frame (~44 Hz) made the drone lag behind the sticks.
 constexpr uint32_t PCMD_PERIOD_MS = 50;
-constexpr uint32_t PCMD_MIN_INTERVAL_MS = 20;
 constexpr uint32_t TRIM_TIMEOUT_MS = 2000;    // no FlatTrimChanged within this time = trim failed
 constexpr uint32_t AUTO_TRIM_WAIT_MS = 3000;  // time for the drone to report that it is landed
 
 // ---------- Console ----------
 constexpr uint32_t CONSOLE_DISCARD_MS = 500;  // input discarded after the serial port turns back on
-constexpr uint32_t PPM_MONITOR_MS = 200;      // PPM monitor (key p) print period
 
 // ---------- BLE ----------
 constexpr int8_t BLE_TX_DBM = 21;          // ESP32-C3 maximum

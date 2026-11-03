@@ -20,7 +20,8 @@ bool droneLinkUp();  // safe from any task
 int droneBattery();  // percent; -1 = unknown
 
 void droneCommand(DroneCmd cmd);
-void dronePcmd(const Pcmd& p);  // sends now and keeps the value for the keepalive
+void dronePcmd(const Pcmd& p);  // keeps the value; sends it if the PCMD period has passed
+uint32_t dronePcmdDueMs();       // time until the next PCMD slot
 void droneTakePicture();
 bool droneListFiles(const char* path);  // the listing goes to the serial log
 

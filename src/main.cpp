@@ -22,8 +22,9 @@ void setup() {
   // Priorities: BLE controller (23) and NimBLE host (21) > loop (2) > LED (1).
   vTaskPrioritySet(nullptr, 2);
   logBegin();
+  logf("build %s %s\n", __DATE__, __TIME__);
   if (FORCE_CONSOLE) logf("FORCED CONSOLE: serial stays on with PPM. Not for normal flight.\n");
-  ppmBegin(PPM_PIN, xTaskGetCurrentTaskHandle());  // setup() runs in the loop() task
+  ppmBegin(PPM_PIN);
   ledBegin();
   droneBegin();
 }
@@ -42,8 +43,8 @@ static void updateSerial(bool rc) {
 }
 
 void loop() {
-  // Sleep until a new PPM frame (the interrupt wakes us) or the keepalive period.
-  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PCMD_PERIOD_MS));
+  // Sleep until a new PPM frame (the interrupt wakes us) or the next PCMD slot.
+  ppmWait(droneLinkUp() ? dronePcmdDueMs() : PCMD_PERIOD_MS);
 
   PpmFrame f = ppmLatest();
   bool rc = f.ageMs < PPM_TIMEOUT_MS;
@@ -64,6 +65,8 @@ void loop() {
       consolePoll();
       logFlush();
     }
+    // Bench: the scan blocks the loop for seconds, so it waits while the monitor runs.
+    if (console && consoleMonitorOn()) return;
     if (!droneConnect()) delay(500);
     logFlush();
     return;

@@ -21,7 +21,7 @@ Swing use the same protocol family but are untested.
 
 ## Features
 
-- PCMD sent on every PPM frame (~22.5 ms), no fixed polling period. The Parrot app uses 50 ms.
+- PCMD every 50 ms, like the Parrot app, always with the newest PPM frame.
 - Serial port fully off while PPM is active, so logging cannot add latency.
 - Acknowledged commands with the same retry rules as the Parrot SDK. The emergency command
   repeats every 100 ms until the drone acknowledges it.
@@ -57,7 +57,8 @@ Avoid GPIO 2, 8 and 9 (strapping pins). Pins are set in `src/config.h`.
 ## Radio setup (OpenI6X / OpenTX)
 
 1. Model Setup: set Internal RF to OFF.
-2. Set the trainer mode to Slave, so the radio outputs PPM on the trainer port.
+2. Set the trainer mode to Slave (Slave/Jack), so the radio outputs PPM on the trainer port.
+   OpenI6X needs version 2.3.0 or later: older versions only offer Master modes. Keep External RF OFF.
 3. Map the channels:
 
 | Channel | Function |

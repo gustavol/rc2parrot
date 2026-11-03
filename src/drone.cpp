@@ -50,13 +50,14 @@ static uint32_t lastPcmdMs = 0;
 //   fa0b, commands:   ACK within 500 ms, 3 retries.
 //   fa0c, emergency:  ACK within 100 ms, unlimited retries while connected.
 // The drone acknowledges on fb1b (fa0b) or fb1c (fa0c) with [T_ACK, own seq, acknowledged seq].
-// A retry repeats the same seq, so the drone drops the duplicate and acknowledges again.
+// One frame in flight per buffer, as libARNetwork does (ARNETWORK_Sender: the next frame waits
+// for the ACK). The drone drops a frame up to 10 behind its last seq, so with several frames in
+// flight a retry that arrives after a newer frame is acknowledged and silently dropped.
 struct Pending {
   uint8_t frame[32];
   uint8_t len;
   uint8_t tries;
   uint32_t sentMs;
-  bool used;
 };
 struct AckChannel {
   const char* name;
@@ -64,7 +65,8 @@ struct AckChannel {
   int maxRetries;  // < 0 = unlimited
   NimBLERemoteCharacteristic* chr;
   uint8_t seq;
-  Pending slots[8];
+  Pending q[8];  // FIFO; q[head] is the frame in flight
+  uint8_t head, count;
 };
 static AckChannel ackCh = {"command", 500, 3}, prioCh = {"emergency", 100, -1};
 
@@ -95,95 +97,108 @@ static void send(NimBLERemoteCharacteristic* c, uint8_t& seq, uint8_t type, cons
   c->writeValue(buf, n + 2, false);
 }
 
+static void transmitHead(AckChannel& ch) {
+  Pending& p = ch.q[ch.head];
+  p.sentMs = millis();
+  ch.chr->writeValue(p.frame, p.len, false);
+}
+
+static void popHead(AckChannel& ch) {
+  ch.head = (ch.head + 1) % 8;
+  if (--ch.count) transmitHead(ch);
+}
+
 static void sendWithAck(AckChannel& ch, const uint8_t* body, size_t n) {
-  Pending* p = nullptr;
-  for (auto& s : ch.slots)
-    if (!s.used) { p = &s; break; }
-  if (!p) {  // queue full: drop the oldest
-    p = &ch.slots[0];
-    for (auto& s : ch.slots)
-      if ((int32_t)(s.sentMs - p->sentMs) < 0) p = &s;
-    logf("%s queue full: dropped the oldest\n", ch.name);
+  if (ch.count == 8) {
+    logf("%s queue full: command dropped\n", ch.name);
+    commandFailed = true;
+    return;
   }
-  p->frame[0] = T_DATA_ACK;
-  p->frame[1] = ++ch.seq;
-  memcpy(p->frame + 2, body, n);
-  p->len = n + 2;
-  p->tries = 0;
-  p->sentMs = millis();
-  p->used = true;
-  ch.chr->writeValue(p->frame, p->len, false);
+  Pending& p = ch.q[(ch.head + ch.count) % 8];
+  p.frame[0] = T_DATA_ACK;
+  p.frame[1] = ++ch.seq;
+  memcpy(p.frame + 2, body, n);
+  p.len = n + 2;
+  p.tries = 0;
+  if (ch.count++ == 0) transmitHead(ch);
 }
 
 static void onAck(AckChannel& ch, uint8_t seq) {
-  for (auto& s : ch.slots)
-    if (s.used && s.frame[1] == seq) {
-      s.used = false;
-      if (&ch == &prioCh) logf("emergency acknowledged\n");
-      return;
-    }
+  if (ch.count && ch.q[ch.head].frame[1] == seq) {
+    if (&ch == &prioCh) logf("emergency acknowledged\n");
+    popHead(ch);
+    return;
+  }
   logf("%s ACK without a pending command (seq %u)\n", ch.name, seq);
 }
 
 static void retry(AckChannel& ch) {
-  uint32_t now = millis();
-  for (auto& s : ch.slots) {
-    if (!s.used || now - s.sentMs < ch.timeoutMs) continue;
-    if (ch.maxRetries >= 0 && s.tries >= ch.maxRetries) {
-      s.used = false;
-      logf("%s not acknowledged, giving up: %u.%u.%u\n", ch.name, s.frame[2], s.frame[3], s.frame[4]);
-      commandFailed = true;
-      continue;
-    }
-    s.tries++;
-    s.sentMs = now;
-    ch.chr->writeValue(s.frame, s.len, false);
-    logf("%s: retry %u\n", ch.name, s.tries);
+  if (!ch.count) return;
+  Pending& p = ch.q[ch.head];
+  if (millis() - p.sentMs < ch.timeoutMs) return;
+  if (ch.maxRetries >= 0 && p.tries >= ch.maxRetries) {
+    logf("%s not acknowledged, giving up: %u.%u.%u\n", ch.name, p.frame[2], p.frame[3], p.frame[4]);
+    commandFailed = true;
+    popHead(ch);
+    return;
   }
+  p.tries++;
+  transmitHead(ch);  // same seq: the drone drops the duplicate and acknowledges again
+  logf("%s: retry %u\n", ch.name, p.tries);
 }
 
 static void resetChannel(AckChannel& ch, NimBLERemoteCharacteristic* chr) {
   ch.chr = chr;
-  for (auto& s : ch.slots) s.used = false;
+  ch.head = ch.count = 0;
 }
 
-// ---------- Drone limits at maximum ----------
-// The radio limits instead (dual rates). After AllSettings, each *Changed event carries
-// current, min and max as floats from d[6]. A limit is written only if current < max.
+// ---------- Drone limits ----------
+// After AllSettings, each *Changed event carries current, min and max as floats from d[6].
+// The firmware writes the target when the current value differs.
 struct Limit {
   const char* name;
   uint8_t evClass, evCmd;    // minidrone.*SettingsState event
   uint8_t setClass, setCmd;  // minidrone.*Settings command
+  float want;                // 0 = the drone maximum
   float current, max;
   volatile bool fresh;
 };
 static Limit limits[] = {
-    {"max tilt (deg)", 9, 1, 8, 1},               // PilotingSettings.MaxTilt
-    {"max vertical speed (m/s)", 5, 0, 1, 0},     // SpeedSettings.MaxVerticalSpeed
-    {"max rotation speed (deg/s)", 5, 1, 1, 1},   // SpeedSettings.MaxRotationSpeed
+    {"max tilt (deg)", 9, 1, 8, 1, MAX_TILT_DEG},     // PilotingSettings.MaxTilt
+    {"max vertical speed (m/s)", 5, 0, 1, 0, 0},      // SpeedSettings.MaxVerticalSpeed
+    {"max rotation speed (deg/s)", 5, 1, 1, 1, 0},    // SpeedSettings.MaxRotationSpeed
 };
 
 static void serviceLimits() {
   for (auto& l : limits) {
     if (!l.fresh) continue;
     l.fresh = false;
-    if (l.current >= l.max - 0.01f) {
-      logf("%s: %.1f, already at max\n", l.name, l.current);
+    float target = (l.want > 0 && l.want < l.max) ? l.want : l.max;
+    if (fabsf(l.current - target) < 0.05f) {
+      logf("%s: %.1f (drone max %.1f)\n", l.name, l.current, l.max);
       continue;
     }
     uint8_t body[8] = {PRJ_MINIDRONE, l.setClass, l.setCmd, 0};
-    memcpy(body + 4, &l.max, 4);
+    memcpy(body + 4, &target, 4);
     sendWithAck(ackCh, body, sizeof body);
-    logf("%s: %.1f -> %.1f\n", l.name, l.current, l.max);
+    logf("%s: %.1f -> %.1f (drone max %.1f)\n", l.name, l.current, target, l.max);
   }
 }
 
 static void sendPcmd(const Pcmd& p) {
   uint8_t flag = (p.roll || p.pitch) ? 1 : 0;  // 0 = the drone ignores roll/pitch and holds position
+  uint32_t t = millis() - linkUpMs;  // timestamp: ms since the connection (minidrone.xml)
   const uint8_t body[] = {PRJ_MINIDRONE, 0, CMD_PCMD, 0, flag, (uint8_t)p.roll, (uint8_t)p.pitch,
-                          (uint8_t)p.yaw, (uint8_t)p.gaz, 0, 0, 0, 0};  // timestamp u32 = 0
+                          (uint8_t)p.yaw, (uint8_t)p.gaz, (uint8_t)t, (uint8_t)(t >> 8),
+                          (uint8_t)(t >> 16), (uint8_t)(t >> 24)};
   send(chNoAck, seqNoAck, T_DATA, body, sizeof body);
   lastPcmdMs = millis();
+}
+
+static const char* flyingStateName() {
+  static const char* const names[] = {"landed",    "taking off", "hovering", "flying",
+                                      "landing",   "emergency",  "rolling",  "init"};
+  return flyingState >= 0 && flyingState < 8 ? names[flyingState] : "unknown";
 }
 
 // ---------- Drone events (NimBLE task) ----------
@@ -206,7 +221,10 @@ static void onNotify(NimBLERemoteCharacteristic* c, uint8_t* d, size_t n, bool) 
   // minidrone.PilotingState: FlatTrimChanged (0), FlyingStateChanged (1), AlertStateChanged (2).
   // Enums are 4 bytes, from d[6].
   if (d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 0) trimEvent = true;
-  if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 1) flyingState = d[6];
+  if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 1 && d[6] != flyingState) {
+    flyingState = d[6];
+    logf("drone state: %s\n", flyingStateName());
+  }
   if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 2 && d[6] != alertState) {
     alertState = d[6];
     logf("drone alert: %s\n", d[6] <= ALERT_LOW_BATTERY ? ALERT_NAMES[d[6]] : "unknown");
@@ -240,6 +258,9 @@ class ClientCallbacks : public NimBLEClientCallbacks {
     flyingState = -1;
     alertState = ALERT_NONE;
     logf("disconnected: %s (0x%x)\n", disconnectText(reason), reason);
+  }
+  void onConnectFail(NimBLEClient*, int reason) override {
+    logf("connection not established: %s (0x%x)\n", disconnectText(reason), reason);
   }
   bool onConnParamsUpdateRequest(NimBLEClient*, const ble_gap_upd_params* p) override {
     logf("drone requested interval %.2f to %.2f ms\n", p->itvl_min * 1.25f, p->itvl_max * 1.25f);
@@ -281,7 +302,11 @@ static bool scanForDrone() {
 
 static bool setupLink() {
   flyingState = -1;
-  if (!client->discoverAttributes()) return false;
+  if (!client->discoverAttributes()) {
+    logf("service discovery failed: error %d, connected %d, services %u\n", client->getLastError(),
+         client->isConnected(), (unsigned)client->getServices(false).size());
+    return false;
+  }
   for (auto* id : NOTIFY_IDS) {
     auto* c = findChr(id);
     if (c && c->canNotify()) c->subscribe(true, onNotify);
@@ -298,9 +323,16 @@ static bool setupLink() {
     return false;
   }
 
-  // common.Common.CurrentDate, as node-rolling-spider sends after connecting
+  // The drone keeps the last sequence number of each buffer until it powers off, and drops a packet
+  // 0..10 behind it while still sending the ACK (libARNetwork ARNETWORK_IOBuffer_ShouldAcceptData).
+  // After an ESP32 restart our counters start over and can fall in that window. Fix: one packet,
+  // then a jump of 11; whether the drone took the first or dropped it, the next one is new.
+  // Command buffer: common.Common.CurrentDate is the harmless first packet.
+  // The emergency buffer gets no probe: anything sent there can trigger a command (a CurrentDate
+  // probe made the drone take off). droneCommand sends the emergency twice instead.
   const uint8_t date[] = {PRJ_COMMON, 4, 1, 0, '2', '0', '1', '4', '-', '1', '0', '-', '2', '8', 0};
   sendWithAck(ackCh, date, sizeof date);
+  ackCh.seq += 10;
   // common.Common.AllStates: without it the drone does not report the battery
   const uint8_t allStates[] = {PRJ_COMMON, 4, 0, 0};
   sendWithAck(ackCh, allStates, sizeof allStates);
@@ -308,10 +340,14 @@ static bool setupLink() {
   const uint8_t allSettings[] = {PRJ_COMMON, 2, 0, 0};
   sendWithAck(ackCh, allSettings, sizeof allSettings);
 
+  // Same probe and jump for the PCMD buffer: a neutral PCMD, then the next one is always new.
+  linkUpMs = millis();
   lastPcmd = {0, 0, 0, 0};
+  sendPcmd(lastPcmd);
+  seqNoAck += 10;
+
   trimWaiting = false;
   autoTrimPending = !autoTrimDone;
-  linkUpMs = millis();
   return true;
 }
 
@@ -332,13 +368,35 @@ void droneBegin() {
   client->setClientCallbacks(&callbacks, false);
   client->setConnectionParams(BLE_INTERVAL_MIN, BLE_INTERVAL_MAX, 0, BLE_SUPERVISION);
   client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+  // NimBLE retries a 0x3e failure in the background, even after connect() returned true. The
+  // client then sits in "connecting" while setupLink runs, and the next connect() is rejected.
+  // Without the retry, the failure is reported and droneConnect tries again from a clean state.
+  client->setConnectRetries(0);
+}
+
+// A link that dies mid-setup (drone battery pulled) can leave the NimBLE client in a
+// "not disconnected" state. From then on every connect() fails at once with BLE_HS_EREJECT,
+// and the library never recovers. A restart is the only reliable reset; it runs only while
+// the drone is not linked.
+static bool connectTo(const NimBLEAddress& a) {
+  if (client->connect(a)) return true;
+  int rc = client->getLastError();
+  logf("connect failed (%d)\n", rc);
+  if (rc == BLE_HS_EREJECT) {
+    logf("BLE client stuck: restarting the ESP32\n");
+    logFlush();
+    delay(100);
+    esp_restart();
+  }
+  return false;
 }
 
 bool droneConnect() {
-  bool connected = !lastAddress.isNull() && client->connect(lastAddress);
-  if (!connected) connected = scanForDrone() && client->connect(lastAddress);
+  bool connected = !lastAddress.isNull() && connectTo(lastAddress);
+  if (!connected) connected = scanForDrone() && connectTo(lastAddress);
   if (!connected) return false;
   if (!setupLink()) {
+    logf("link setup failed\n");
     client->disconnect();
     return false;
   }
@@ -349,6 +407,11 @@ bool droneConnect() {
 }
 
 bool droneLinkUp() { return linkUp; }
+
+uint32_t dronePcmdDueMs() {
+  uint32_t elapsed = millis() - lastPcmdMs;
+  return elapsed >= PCMD_PERIOD_MS ? 0 : PCMD_PERIOD_MS - elapsed;
+}
 int droneBattery() { return battery; }
 
 void droneCommand(DroneCmd cmd) {
@@ -359,19 +422,32 @@ void droneCommand(DroneCmd cmd) {
     commandFailed = true;
     return;
   }
+  // The throttle stick has no spring: up = full climb right after take-off.
+  if (cmd == DroneCmd::TakeOff && lastPcmd.gaz != 0) {
+    logf("take-off blocked: center the throttle stick\n");
+    commandFailed = true;
+    return;
+  }
   const uint8_t body[] = {PRJ_MINIDRONE, 0, (uint8_t)cmd, 0};  // class Piloting = 0
   if (cmd == DroneCmd::FlatTrim) {
     trimEvent = false;
     trimWaiting = true;
     trimSentMs = millis();
   }
-  sendWithAck(cmd == DroneCmd::Emergency ? prioCh : ackCh, body, sizeof body);
+  if (cmd == DroneCmd::Emergency) {
+    // Two copies 11 apart: at least one is outside the drone's duplicate window (see setupLink).
+    sendWithAck(prioCh, body, sizeof body);
+    prioCh.seq += 10;
+    sendWithAck(prioCh, body, sizeof body);
+  } else {
+    sendWithAck(ackCh, body, sizeof body);
+  }
   logf("cmd %u\n", (unsigned)cmd);
 }
 
 void dronePcmd(const Pcmd& p) {
   lastPcmd = p;  // if it is too early, the keepalive or the next frame sends this value
-  if (linkUp && millis() - lastPcmdMs >= PCMD_MIN_INTERVAL_MS) sendPcmd(p);
+  if (linkUp && millis() - lastPcmdMs >= PCMD_PERIOD_MS) sendPcmd(p);
 }
 
 void droneTakePicture() {
@@ -444,4 +520,6 @@ void dronePrintInfo() {
   NimBLEConnInfo info = client->getConnInfo();
   logf("interval %.2f ms, latency %u, MTU %u, RSSI %d dBm, TX power %d dBm\n", info.getConnInterval() * 1.25f,
        info.getConnLatency(), client->getMTU(), client->getRssi(), NimBLEDevice::getPower());
+  logf("drone state: %s, battery %d%%, alert %s\n", flyingStateName(), battery,
+       alertState <= ALERT_LOW_BATTERY ? ALERT_NAMES[alertState] : "unknown");
 }
