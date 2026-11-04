@@ -27,6 +27,11 @@ constexpr int DEADBAND_GAZ = 12;  // the throttle stick has no spring, so it get
 // Roll and pitch command a tilt angle, which is acceleration: the speed keeps growing while the
 // stick is off center, so the drone itself must cap the angle. 0 = drone maximum.
 constexpr float MAX_TILT_DEG = 10;
+// Drone settings written on each connection. They stay in the drone until it changes them again.
+constexpr float MAX_ALTITUDE_M = 2.5;  // 2..25 m; the drone stops climbing here
+constexpr float BANKED_TURN = 1;       // 1 = yaw also banks the drone when it moves, like a plane (app default)
+constexpr uint8_t ACCESSORY = 3;  // 0 none, 1 wheels, 2 truck wheels, 3 hull (propeller guard), 4 hydrofoil
+constexpr float CUT_OUT_MODE = 1;      // 1 = motors stop on a hard impact or when the drone turns over
 
 // ---------- Timing ----------
 constexpr uint32_t PPM_TIMEOUT_MS = 300;  // no PPM for this long = failsafe landing
@@ -42,7 +47,9 @@ constexpr uint32_t CONSOLE_DISCARD_MS = 500;  // input discarded after the seria
 // ---------- BLE ----------
 constexpr int8_t BLE_TX_DBM = 21;          // ESP32-C3 maximum
 constexpr uint16_t BLE_INTERVAL_MIN = 6;   // x 1.25 ms = 7.5 ms
-constexpr uint16_t BLE_INTERVAL_MAX = 12;  // x 1.25 ms = 15 ms; the drone picks within the range
+// x 1.25 ms. The drone asks for 7.5..12.5 ms; with a range the ESP32 took 12.5. Equal to the
+// minimum = fixed 7.5 ms. Set 12 to go back to 7.5..15 ms.
+constexpr uint16_t BLE_INTERVAL_MAX = 6;
 constexpr uint16_t BLE_SUPERVISION = 200;  // x 10 ms = 2 s without packets = disconnected
 constexpr uint32_t BLE_SCAN_MS = 5000;
 constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 3000;

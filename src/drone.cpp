@@ -153,34 +153,38 @@ static void resetChannel(AckChannel& ch, NimBLERemoteCharacteristic* chr) {
 }
 
 // ---------- Drone limits ----------
-// After AllSettings, each *Changed event carries current, min and max as floats from d[6].
-// The firmware writes the target when the current value differs.
+// After AllSettings, each *Changed event carries current, min and max as floats from d[6], or one
+// u8 at d[6] for on-off settings. The firmware writes the target when the current value differs.
 struct Limit {
   const char* name;
   uint8_t evClass, evCmd;    // minidrone.*SettingsState event
   uint8_t setClass, setCmd;  // minidrone.*Settings command
-  float want;                // 0 = the drone maximum
+  float want;                // float: 0 = the drone maximum; on-off: 0 or 1
+  bool onOff;                // u8 setting instead of float
   float current, max;
   volatile bool fresh;
 };
 static Limit limits[] = {
-    {"max tilt (deg)", 9, 1, 8, 1, MAX_TILT_DEG},     // PilotingSettings.MaxTilt
-    {"max vertical speed (m/s)", 5, 0, 1, 0, 0},      // SpeedSettings.MaxVerticalSpeed
-    {"max rotation speed (deg/s)", 5, 1, 1, 1, 0},    // SpeedSettings.MaxRotationSpeed
+    {"max tilt (deg)", 9, 1, 8, 1, MAX_TILT_DEG},           // PilotingSettings.MaxTilt
+    {"max altitude (m)", 9, 0, 8, 0, MAX_ALTITUDE_M},       // PilotingSettings.MaxAltitude
+    {"max vertical speed (m/s)", 5, 0, 1, 0, 0},            // SpeedSettings.MaxVerticalSpeed
+    {"max rotation speed (deg/s)", 5, 1, 1, 1, 0},          // SpeedSettings.MaxRotationSpeed
+    {"banked turn", 9, 2, 8, 2, BANKED_TURN, true},         // PilotingSettings.BankedTurn
+    {"cut-out on impact", 11, 2, 10, 0, CUT_OUT_MODE, true},  // Settings.CutOutMode
 };
 
 static void serviceLimits() {
   for (auto& l : limits) {
     if (!l.fresh) continue;
     l.fresh = false;
-    float target = (l.want > 0 && l.want < l.max) ? l.want : l.max;
+    float target = l.onOff ? l.want : (l.want > 0 && l.want < l.max) ? l.want : l.max;
     if (fabsf(l.current - target) < 0.05f) {
       logf("%s: %.1f (drone max %.1f)\n", l.name, l.current, l.max);
       continue;
     }
-    uint8_t body[8] = {PRJ_MINIDRONE, l.setClass, l.setCmd, 0};
-    memcpy(body + 4, &target, 4);
-    sendWithAck(ackCh, body, sizeof body);
+    uint8_t body[8] = {PRJ_MINIDRONE, l.setClass, l.setCmd, 0, (uint8_t)target};
+    if (!l.onOff) memcpy(body + 4, &target, 4);
+    sendWithAck(ackCh, body, l.onOff ? 5 : sizeof body);
     logf("%s: %.1f -> %.1f (drone max %.1f)\n", l.name, l.current, target, l.max);
   }
 }
@@ -202,6 +206,21 @@ static const char* flyingStateName() {
 }
 
 // ---------- Drone events (NimBLE task) ----------
+// Each event id is logged once per connection with its raw arguments. This shows what this drone
+// firmware really sends (for example NavigationDataState, which older firmware does not have).
+static uint32_t seenEvents[64];
+static uint8_t seenCount = 0;
+
+static void logFirstSeen(const uint8_t* d, size_t n) {
+  uint32_t id = d[2] << 16 | d[3] << 8 | d[4];
+  for (uint8_t i = 0; i < seenCount; i++)
+    if (seenEvents[i] == id) return;
+  if (seenCount < 64) seenEvents[seenCount++] = id;
+  char hex[3 * 16 + 1] = "";
+  for (size_t i = 6; i < n && i < 22; i++) sprintf(hex + 3 * (i - 6), " %02x", d[i]);
+  logf("event %u.%u.%u:%s\n", d[2], d[3], d[4], hex);
+}
+
 static void onNotify(NimBLERemoteCharacteristic* c, uint8_t* d, size_t n, bool) {
   if (ftpOwns(c)) { ftpOnNotify(d, n); return; }
   const NimBLEUUID& u = c->getUUID();
@@ -211,11 +230,17 @@ static void onNotify(NimBLERemoteCharacteristic* c, uint8_t* d, size_t n, bool) 
     return;
   }
   if (n >= 2 && d[0] == T_DATA_ACK && u == uuidAckData) pushEvent(EV_DRONE_NEEDS_ACK, d[1]);
-  if (n < 5) return;
+  if (n < 6) return;
+  logFirstSeen(d, n);
   for (auto& l : limits)
-    if (n >= 18 && d[2] == PRJ_MINIDRONE && d[3] == l.evClass && d[4] == l.evCmd) {
-      memcpy(&l.current, d + 6, 4);
-      memcpy(&l.max, d + 14, 4);
+    if (d[2] == PRJ_MINIDRONE && d[3] == l.evClass && d[4] == l.evCmd && n >= (l.onOff ? 7u : 18u)) {
+      if (l.onOff) {
+        l.current = d[6];
+        l.max = 1;
+      } else {
+        memcpy(&l.current, d + 6, 4);
+        memcpy(&l.max, d + 14, 4);
+      }
       l.fresh = true;
     }
   // minidrone.PilotingState: FlatTrimChanged (0), FlyingStateChanged (1), AlertStateChanged (2).
@@ -228,6 +253,17 @@ static void onNotify(NimBLERemoteCharacteristic* c, uint8_t* d, size_t n, bool) 
   if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 2 && d[6] != alertState) {
     alertState = d[6];
     logf("drone alert: %s\n", d[6] <= ALERT_LOW_BATTERY ? ALERT_NAMES[d[6]] : "unknown");
+  }
+  // minidrone.FloodControlState.FloodControlChanged: the delay the drone wants between two PCMDs.
+  // Deprecated in the XML, so newer firmware may not send it.
+  if (n >= 8 && d[2] == PRJ_MINIDRONE && d[3] == 12 && d[4] == 0)
+    logf("drone PCMD delay: %u ms (we send every %u ms)\n", d[6] | (d[7] << 8), (unsigned)PCMD_PERIOD_MS);
+  // common.AccessoryState.AccessoryConfigChanged: accessory enum at d[6], error enum at d[10].
+  if (n >= 14 && d[2] == PRJ_COMMON && d[3] == 27 && d[4] == 1) {
+    static const char* const names[] = {"unconfigured", "none",      "wheels",     "truck wheels",
+                                        "hull",         "hydrofoil", "in progress"};
+    static const char* const errors[] = {"ok", "unknown", "flying"};
+    logf("accessory: %s (%s)\n", d[6] <= 6 ? names[d[6]] : "?", d[10] <= 2 ? errors[d[10]] : "?");
   }
   // minidrone.MediaRecordEvent.PictureEventChanged. Error enum from d[10]:
   // 1 unknown, 2 busy, 3 not available, 4 memory full, 5 low battery.
@@ -330,12 +366,17 @@ static bool setupLink() {
   // Command buffer: common.Common.CurrentDate is the harmless first packet.
   // The emergency buffer gets no probe: anything sent there can trigger a command (a CurrentDate
   // probe made the drone take off). droneCommand sends the emergency twice instead.
+  seenCount = 0;
   const uint8_t date[] = {PRJ_COMMON, 4, 1, 0, '2', '0', '1', '4', '-', '1', '0', '-', '2', '8', 0};
   sendWithAck(ackCh, date, sizeof date);
   ackCh.seq += 10;
   // common.Common.AllStates: without it the drone does not report the battery
   const uint8_t allStates[] = {PRJ_COMMON, 4, 0, 0};
   sendWithAck(ackCh, allStates, sizeof allStates);
+  // common.Accessory.Config: the drone reported UNCONFIGURED even after the app set the hull,
+  // so the firmware declares the accessory on each connection.
+  const uint8_t accessory[] = {PRJ_COMMON, 26, 0, 0, ACCESSORY, 0, 0, 0};
+  sendWithAck(ackCh, accessory, sizeof accessory);
   // common.Settings.AllSettings: the drone replies with current, min and max limits
   const uint8_t allSettings[] = {PRJ_COMMON, 2, 0, 0};
   sendWithAck(ackCh, allSettings, sizeof allSettings);
