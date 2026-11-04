@@ -6,6 +6,7 @@
 #include "config.h"
 #include "ftp.h"
 #include "log.h"
+#include "settings.h"
 
 // ---------- ARSDK3 framing ----------
 // Frame: [type, seq, project, class, cmd_lo, cmd_hi, args...]
@@ -23,6 +24,8 @@ static uint8_t seqNoAck, seqAckOut;
 static NimBLEAddress lastAddress;  // reconnects skip the scan
 
 static volatile bool linkUp = false;
+static volatile int rssi = 0;           // dBm, read in droneService; 0 = unknown
+static volatile int linkQuality = 100;  // 0..100, from the ACKs of the acknowledged commands
 static volatile int battery = -1;
 static volatile int flyingState = -1;  // minidrone.PilotingState.FlyingStateChanged; 0 = landed
 static volatile bool trimEvent = false;
@@ -125,6 +128,7 @@ static void sendWithAck(AckChannel& ch, const uint8_t* body, size_t n) {
 
 static void onAck(AckChannel& ch, uint8_t seq) {
   if (ch.count && ch.q[ch.head].frame[1] == seq) {
+    linkQuality = linkQuality + (100 - linkQuality + 3) / 4;
     if (&ch == &prioCh) logf("emergency acknowledged\n");
     popHead(ch);
     return;
@@ -136,6 +140,7 @@ static void retry(AckChannel& ch) {
   if (!ch.count) return;
   Pending& p = ch.q[ch.head];
   if (millis() - p.sentMs < ch.timeoutMs) return;
+  linkQuality = linkQuality - (linkQuality + 3) / 4;  // each timeout counts as a lost frame
   if (ch.maxRetries >= 0 && p.tries >= ch.maxRetries) {
     logf("%s not acknowledged, giving up: %u.%u.%u\n", ch.name, p.frame[2], p.frame[3], p.frame[4]);
     commandFailed = true;
@@ -159,25 +164,27 @@ struct Limit {
   const char* name;
   uint8_t evClass, evCmd;    // minidrone.*SettingsState event
   uint8_t setClass, setCmd;  // minidrone.*Settings command
-  float want;                // float: 0 = the drone maximum; on-off: 0 or 1
+  const uint8_t* setting;    // field of settings; nullptr = the drone maximum
+  float scale;               // setting unit -> drone unit
   bool onOff;                // u8 setting instead of float
   float current, max;
   volatile bool fresh;
 };
 static Limit limits[] = {
-    {"max tilt (deg)", 9, 1, 8, 1, MAX_TILT_DEG},           // PilotingSettings.MaxTilt
-    {"max altitude (m)", 9, 0, 8, 0, MAX_ALTITUDE_M},       // PilotingSettings.MaxAltitude
-    {"max vertical speed (m/s)", 5, 0, 1, 0, 0},            // SpeedSettings.MaxVerticalSpeed
-    {"max rotation speed (deg/s)", 5, 1, 1, 1, 0},          // SpeedSettings.MaxRotationSpeed
-    {"banked turn", 9, 2, 8, 2, BANKED_TURN, true},         // PilotingSettings.BankedTurn
-    {"cut-out on impact", 11, 2, 10, 0, CUT_OUT_MODE, true},  // Settings.CutOutMode
+    {"max tilt (deg)", 9, 1, 8, 1, &settings.maxTilt, 1},                       // PilotingSettings.MaxTilt
+    {"max altitude (m)", 9, 0, 8, 0, &settings.maxAltitude, 0.1f},              // PilotingSettings.MaxAltitude
+    {"max vertical speed (m/s)", 5, 0, 1, 0, &settings.maxVertSpeed, 0.01f},    // SpeedSettings.MaxVerticalSpeed
+    {"max rotation speed (deg/s)", 5, 1, 1, 1, &settings.maxRotSpeed, 1},       // SpeedSettings.MaxRotationSpeed
+    {"banked turn", 9, 2, 8, 2, &settings.bankedTurn, 1, true},                 // PilotingSettings.BankedTurn
+    {"cut-out on impact", 11, 2, 10, 0, &settings.cutOut, 1, true},             // Settings.CutOutMode
 };
 
 static void serviceLimits() {
   for (auto& l : limits) {
     if (!l.fresh) continue;
     l.fresh = false;
-    float target = l.onOff ? l.want : (l.want > 0 && l.want < l.max) ? l.want : l.max;
+    float want = l.setting ? *l.setting * l.scale : 0;
+    float target = l.onOff ? want : (want > 0 && want < l.max) ? want : l.max;
     if (fabsf(l.current - target) < 0.05f) {
       logf("%s: %.1f (drone max %.1f)\n", l.name, l.current, l.max);
       continue;
@@ -187,6 +194,14 @@ static void serviceLimits() {
     sendWithAck(ackCh, body, l.onOff ? 5 : sizeof body);
     logf("%s: %.1f -> %.1f (drone max %.1f)\n", l.name, l.current, target, l.max);
   }
+}
+
+static uint8_t sentAccessory = 0xFF;
+
+static void sendAccessory() {
+  const uint8_t body[] = {PRJ_COMMON, 26, 0, 0, settings.accessory, 0, 0, 0};  // common.Accessory.Config
+  sendWithAck(ackCh, body, sizeof body);
+  sentAccessory = settings.accessory;
 }
 
 static void sendPcmd(const Pcmd& p) {
@@ -199,7 +214,7 @@ static void sendPcmd(const Pcmd& p) {
   lastPcmdMs = millis();
 }
 
-static const char* flyingStateName() {
+const char* droneStateName() {
   static const char* const names[] = {"landed",    "taking off", "hovering", "flying",
                                       "landing",   "emergency",  "rolling",  "init"};
   return flyingState >= 0 && flyingState < 8 ? names[flyingState] : "unknown";
@@ -248,7 +263,7 @@ static void onNotify(NimBLERemoteCharacteristic* c, uint8_t* d, size_t n, bool) 
   if (d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 0) trimEvent = true;
   if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 1 && d[6] != flyingState) {
     flyingState = d[6];
-    logf("drone state: %s\n", flyingStateName());
+    logf("drone state: %s\n", droneStateName());
   }
   if (n >= 7 && d[2] == PRJ_MINIDRONE && d[3] == 3 && d[4] == 2 && d[6] != alertState) {
     alertState = d[6];
@@ -375,8 +390,7 @@ static bool setupLink() {
   sendWithAck(ackCh, allStates, sizeof allStates);
   // common.Accessory.Config: the drone reported UNCONFIGURED even after the app set the hull,
   // so the firmware declares the accessory on each connection.
-  const uint8_t accessory[] = {PRJ_COMMON, 26, 0, 0, ACCESSORY, 0, 0, 0};
-  sendWithAck(ackCh, accessory, sizeof accessory);
+  sendAccessory();
   // common.Settings.AllSettings: the drone replies with current, min and max limits
   const uint8_t allSettings[] = {PRJ_COMMON, 2, 0, 0};
   sendWithAck(ackCh, allSettings, sizeof allSettings);
@@ -441,6 +455,8 @@ bool droneConnect() {
     client->disconnect();
     return false;
   }
+  linkQuality = 100;
+  rssi = 0;
   linkUp = true;
   logf("connected\n");
   dronePrintInfo();
@@ -502,6 +518,11 @@ bool droneListFiles(const char* path) { return linkUp && ftpList(path); }
 
 void droneService() {
   if (!linkUp) return;
+  static uint32_t lastRssiMs = 0;
+  if (millis() - lastRssiMs >= 1000) {  // for the CRSF telemetry; a local controller read
+    lastRssiMs = millis();
+    rssi = client->getRssi();
+  }
   uint16_t e;
   while (xQueueReceive(events, &e, 0) == pdTRUE) {
     uint8_t seq = e & 0xff;
@@ -561,6 +582,20 @@ void dronePrintInfo() {
   NimBLEConnInfo info = client->getConnInfo();
   logf("interval %.2f ms, latency %u, MTU %u, RSSI %d dBm, TX power %d dBm\n", info.getConnInterval() * 1.25f,
        info.getConnLatency(), client->getMTU(), client->getRssi(), NimBLEDevice::getPower());
-  logf("drone state: %s, battery %d%%, alert %s\n", flyingStateName(), battery,
+  logf("drone state: %s, battery %d%%, alert %s\n", droneStateName(), battery,
        alertState <= ALERT_LOW_BATTERY ? ALERT_NAMES[alertState] : "unknown");
+}
+
+int droneRssi() { return linkUp ? rssi : 0; }
+
+int droneLinkQuality() {
+  if (!linkUp) return 0;
+  return linkQuality > 1 ? linkQuality : 1;  // 0 would tell the radio that the link is lost
+}
+
+void droneApplySettings() {
+  if (!linkUp) return;  // the next connection sends them
+  for (auto& l : limits)
+    if (l.max > 0) l.fresh = true;  // serviceLimits writes the ones that differ
+  if (settings.accessory != sentAccessory) sendAccessory();  // the drone refuses it in flight
 }

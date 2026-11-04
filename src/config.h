@@ -2,15 +2,35 @@
 #pragma once
 #include <stdint.h>
 
-// 1 = keep the serial console on while PPM is active. For bench setup only: the serial port adds
+// 1 = keep the serial console on while the radio is active. For bench setup only: the serial port adds
 // some latency. The esp32c3_console environment in platformio.ini sets this.
 #ifndef FORCE_CONSOLE
 #define FORCE_CONSOLE 0
 #endif
 
+// 1 = radio link test: no drone scan, radio monitor on from boot. The esp32c3_crsf_test environment
+// sets this.
+#ifndef NO_DRONE
+#define NO_DRONE 0
+#endif
+
+// ---------- Radio input ----------
+// 0 = PPM from the trainer jack. 1 = CRSF full duplex on the external module port: channels in,
+// telemetry out. OpenI6X: TX2 pad -> CRSF_PIN, PA15 pad <- CRSF_TX_PIN; needs a build with
+// CRSF_FULLDUPLEX=YES (2.3.0) or the "CRSF Duplex" option (later versions).
+// The esp32c3_crsf environments in platformio.ini set this.
+#ifndef INPUT_CRSF
+#define INPUT_CRSF 0
+#endif
+constexpr uint32_t CRSF_BAUD = 400000;  // OpenI6X: Radio Settings > Hardware > Baudrate (400k = 4 ms frames)
+constexpr bool CRSF_INVERTED = false;   // full duplex is not inverted; the one-wire half-duplex mode is
+constexpr uint32_t CRSF_TELEMETRY_MS = 200;  // battery, RSSI, link quality and drone state to the radio; 0 = off
+
 // ---------- Pins (ESP32-C3) ----------
 // Avoid GPIO 2, 8 and 9: strapping pins.
-constexpr int PPM_PIN = 4;  // PPM from the radio trainer port
+constexpr int PPM_PIN = 4;   // PPM from the radio trainer port
+constexpr int CRSF_PIN = 4;     // CRSF from the radio TX2 pad (UART1 RX)
+constexpr int CRSF_TX_PIN = 3;  // CRSF telemetry to the radio PA15 pad (UART1 TX)
 constexpr int LED_PIN = 5;  // RGBW NeoPixel (SK6812)
 
 // ---------- Radio channels (index 0 = CH1) ----------
@@ -23,19 +43,23 @@ constexpr int CH_TRIM = 6;  // switch or button: rising edge = flat trim (landed
 constexpr int SWITCH_US = 1250;   // switch is "high" above this; the radio switches give 1000 (off) and 1500 (on)
 constexpr int DEADBAND = 5;       // stick center deadband, in %
 constexpr int DEADBAND_GAZ = 12;  // the throttle stick has no spring, so it gets a wider center
-// Throttle and yaw command a speed: those drone limits stay at maximum and the radio limits them.
+// ---------- Drone settings (defaults) ----------
+// Written to the drone on every connection. CRSF builds can change them from the radio menu and
+// save them in flash (settings.h); these values are used until then.
 // Roll and pitch command a tilt angle, which is acceleration: the speed keeps growing while the
-// stick is off center, so the drone itself must cap the angle. 0 = drone maximum.
-constexpr float MAX_TILT_DEG = 10;
-// Drone settings written on each connection. They stay in the drone until it changes them again.
-constexpr float MAX_ALTITUDE_M = 2.5;  // 2..25 m; the drone stops climbing here
-constexpr float BANKED_TURN = 1;       // 1 = yaw also banks the drone when it moves, like a plane (app default)
-constexpr uint8_t ACCESSORY = 3;  // 0 none, 1 wheels, 2 truck wheels, 3 hull (propeller guard), 4 hydrofoil
-constexpr float CUT_OUT_MODE = 1;      // 1 = motors stop on a hard impact or when the drone turns over
+// stick is off center, so the drone itself must cap the angle. Throttle and yaw command a speed:
+// those limits stay at the drone maximum and the radio limits them (rates, expo).
+constexpr uint8_t DEFAULT_MAX_TILT_DEG = 10;         // 5..25
+constexpr uint8_t DEFAULT_MAX_ALTITUDE_DM = 25;      // 20..250 dm (2..25 m); the drone stops climbing here
+constexpr uint8_t DEFAULT_MAX_VERT_SPEED_CMS = 200;  // 50..200 (0.5..2 m/s)
+constexpr uint8_t DEFAULT_MAX_ROT_SPEED_DPS = 180;   // 50..180
+constexpr uint8_t DEFAULT_BANKED_TURN = 1;           // 1 = yaw also banks the drone when it moves (app default)
+constexpr uint8_t DEFAULT_CUT_OUT = 1;               // 1 = motors stop on a hard impact or when the drone turns over
+constexpr uint8_t DEFAULT_ACCESSORY = 3;             // 0 none, 1 wheels, 2 truck wheels, 3 hull (propeller guard), 4 hydrofoil
 
 // ---------- Timing ----------
-constexpr uint32_t PPM_TIMEOUT_MS = 300;  // no PPM for this long = failsafe landing
-// One PCMD per period, with the newest radio value. The Parrot app sends at 50 ms. Sending on every
+constexpr uint32_t RC_TIMEOUT_MS = 300;  // no radio frame for this long = failsafe landing
+// One PCMD per period, with the newest radio frame. The Parrot app sends at 50 ms. Sending on every
 // PPM frame (~44 Hz) made the drone lag behind the sticks.
 constexpr uint32_t PCMD_PERIOD_MS = 50;
 constexpr uint32_t TRIM_TIMEOUT_MS = 2000;    // no FlatTrimChanged within this time = trim failed

@@ -16,7 +16,7 @@ static_assert(stickToCmd(2000, 5) == 100, "max");
 static_assert(stickToCmd(2200, 5) == 100, "clamp");
 static_assert(stickToCmd(1000, 5) == -100, "min");
 
-void pilotOnFrame(const uint16_t* ch);  // new PPM frame: PCMD and switch commands go out now
+void pilotOnFrame(const uint16_t* ch);  // new radio frame: PCMD and switch commands go out now
 void pilotSignalLost();                 // failsafe: land once and zero the PCMD
 
 // New connection: the current arm and trim switch positions do not trigger a command.

@@ -38,3 +38,11 @@ TrimResult droneTakeTrimResult();
 bool droneTakeCommandFailed();
 
 void dronePrintInfo();  // connection interval, MTU, RSSI
+
+// Sends the current settings (settings.h) now, if connected. Loop task only.
+void droneApplySettings();
+
+// For the CRSF telemetry. Safe from any task.
+const char* droneStateName();  // flying state as text ("landed", "hovering"); "unknown" before the first event
+int droneRssi();               // BLE RSSI in dBm, updated every second; 0 = unknown or not connected
+int droneLinkQuality();        // 1..100 while connected, from the command ACKs; 0 = not connected

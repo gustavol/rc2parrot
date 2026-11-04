@@ -1,13 +1,15 @@
-// RC radio (trainer port, PPM) -> ESP32-C3 -> BLE -> Parrot minidrone.
+// RC radio (PPM from the trainer port, or CRSF) -> ESP32-C3 -> BLE -> Parrot minidrone.
 //
-//   config.h        pins, channel map, tuning
-//   ppm.*           PPM input (interrupt); ppm_decoder.h is the host-testable decoder
+//   config.h        pins, channel map, tuning, input selection (INPUT_CRSF)
+//   rc.h            radio input interface
+//   ppm.cpp         PPM input (interrupt); ppm_decoder.h is the host-testable decoder
+//   crsf.cpp        CRSF input (UART); crsf_decoder.h is the host-testable decoder
 //   pilot.*         sticks and switches -> drone commands, failsafe
 //   drone.*         BLE link and ARSDK3 protocol
 //   ftp.*           drone file listing (FTP over BLE)
 //   led.*           status LED
-//   log.*           USB serial output, fully off while PPM is active
-//   console.*       serial test commands (without PPM, or with FORCE_CONSOLE)
+//   log.*           USB serial output, fully off while the radio is active
+//   console.*       serial test commands (without radio, or with FORCE_CONSOLE)
 #include <Arduino.h>
 
 #include "config.h"
@@ -16,38 +18,47 @@
 #include "led.h"
 #include "log.h"
 #include "pilot.h"
-#include "ppm.h"
+#include "rc.h"
+#include "settings.h"
 
 void setup() {
   // Priorities: BLE controller (23) and NimBLE host (21) > loop (2) > LED (1).
   vTaskPrioritySet(nullptr, 2);
   logBegin();
   logf("build %s %s\n", __DATE__, __TIME__);
-  if (FORCE_CONSOLE) logf("FORCED CONSOLE: serial stays on with PPM. Not for normal flight.\n");
-  ppmBegin(PPM_PIN);
+  logf("radio input: %s\n", INPUT_CRSF ? "CRSF" : "PPM");
+  if (FORCE_CONSOLE) logf("FORCED CONSOLE: serial stays on with the radio. Not for normal flight.\n");
+  settingsBegin();
+  rcBegin();
   ledBegin();
   droneBegin();
 }
 
-// While PPM is active the serial port is off: no output, no input, no USB interrupts.
+// While the radio is active the serial port is off: no output, no input, no USB interrupts.
 static void updateSerial(bool rc) {
   if (rc == !logSerialOn()) return;
   if (rc) {
-    logf("PPM active: serial off\n");
+    logf("radio active: serial off\n");
     logSetSerial(false);
   } else {
     logSetSerial(true);
     consoleReset();
-    logf("no PPM: console on (h = help)\n");
+    logf("no radio: console on (h = help)\n");
   }
 }
 
 void loop() {
-  // Sleep until a new PPM frame (the interrupt wakes us) or the next PCMD slot.
-  ppmWait(droneLinkUp() ? dronePcmdDueMs() : PCMD_PERIOD_MS);
+  // Sleep until a new radio frame or the next PCMD slot.
+  rcWait(droneLinkUp() ? dronePcmdDueMs() : PCMD_PERIOD_MS);
 
-  PpmFrame f = ppmLatest();
-  bool rc = f.ageMs < PPM_TIMEOUT_MS;
+  if (settingsChanged) {  // changed in the radio menu
+    settingsChanged = false;
+    settingsSave();
+    droneApplySettings();
+  }
+
+  RcFrame f = rcLatest();
+  bool rc = f.ageMs < RC_TIMEOUT_MS;
   bool console = FORCE_CONSOLE || !rc;
   if (!FORCE_CONSOLE) updateSerial(rc);
 
@@ -61,12 +72,12 @@ void loop() {
 
   if (!droneLinkUp()) {
     pilotReset();
-    if (console) {  // lets you watch PPM without the drone
+    if (console) {  // lets you watch the radio without the drone
       consolePoll();
       logFlush();
     }
     // Bench: the scan blocks the loop for seconds, so it waits while the monitor runs.
-    if (console && consoleMonitorOn()) return;
+    if (NO_DRONE || (console && consoleMonitorOn())) return;
     if (!droneConnect()) delay(500);
     logFlush();
     return;

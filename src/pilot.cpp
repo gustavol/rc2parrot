@@ -30,7 +30,7 @@ void pilotOnFrame(const uint16_t* ch) {
 
 void pilotSignalLost() {
   if (!switchesKnown) return;  // already handled, or no signal yet
-  logf("PPM lost: landing\n");
+  logf("radio signal lost: landing\n");
   droneCommand(DroneCmd::Landing);
   dronePcmd({0, 0, 0, 0});
   switchesKnown = false;  // when the signal returns, the arm switch position does not take off
