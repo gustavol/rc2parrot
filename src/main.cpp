@@ -17,6 +17,7 @@
 #include "drone.h"
 #include "led.h"
 #include "log.h"
+#include "ota.h"
 #include "pilot.h"
 #include "rc.h"
 #include "settings.h"
@@ -57,10 +58,22 @@ void loop() {
     droneApplySettings();
   }
 
+  otaService();
+
   RcFrame f = rcLatest();
   bool rc = f.ageMs < RC_TIMEOUT_MS;
   bool console = FORCE_CONSOLE || !rc;
   if (!FORCE_CONSOLE) updateSerial(rc);
+
+  // Radio off, or on another model, for a while: no drone scan (see RADIO_IDLE_MS).
+  bool idle = !FORCE_CONSOLE && f.ageMs >= RADIO_IDLE_MS && millis() >= RADIO_IDLE_MS;
+  static bool wasIdle = false;
+  if (idle != wasIdle) {
+    wasIdle = idle;
+    ledSetIdle(idle);
+    logf(idle ? "no radio for %lu s: drone scan stopped\n" : "radio back: drone scan on\n",
+         (unsigned long)(RADIO_IDLE_MS / 1000));
+  }
 
   // Before the link check, so a failure right before a disconnect still flashes the LED.
   switch (droneTakeTrimResult()) {
@@ -77,7 +90,7 @@ void loop() {
       logFlush();
     }
     // Bench: the scan blocks the loop for seconds, so it waits while the monitor runs.
-    if (NO_DRONE || (console && consoleMonitorOn())) return;
+    if (NO_DRONE || idle || otaActive() || (console && consoleMonitorOn())) return;
     if (!droneConnect()) delay(500);
     logFlush();
     return;
@@ -91,6 +104,11 @@ void loop() {
     pilotSignalLost();
   }
   droneService();
+  // Wait for the failsafe landing before letting the drone go.
+  if (idle && droneLanded()) {
+    logf("no radio: disconnecting the landed drone\n");
+    droneDisconnect();
+  }
 
   if (console) {
     consolePoll();

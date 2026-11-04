@@ -599,3 +599,9 @@ void droneApplySettings() {
     if (l.max > 0) l.fresh = true;  // serviceLimits writes the ones that differ
   if (settings.accessory != sentAccessory) sendAccessory();  // the drone refuses it in flight
 }
+
+bool droneLanded() { return flyingState == 0; }
+
+void droneDisconnect() {
+  if (client && client->isConnected()) client->disconnect();
+}

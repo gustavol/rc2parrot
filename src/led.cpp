@@ -5,6 +5,8 @@
 #include "config.h"
 #include "drone.h"
 
+#if USE_LED
+
 // The LED is RGBW: 32 bits per frame in G R B W order. The core's rgbLedWrite() sends only
 // 24 bits, which misaligns the bytes. Same RMT timing as the core (0.1 us per tick), with W = 0.
 static void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
@@ -48,6 +50,8 @@ static void batteryColor(int pct, uint8_t& r, uint8_t& g) {
 }
 
 // Own task because the BLE scan blocks the loop for seconds.
+static volatile bool idle = false;  // see ledSetIdle
+
 static void ledTask(void*) {
   uint32_t shown = UINT32_MAX;  // forces the first write
   for (;;) {
@@ -65,7 +69,8 @@ static void ledTask(void*) {
     }
     int b = droneBattery();
     uint8_t r = 0, g = 0, bl = 0;
-    if (!droneLinkUp()) bl = (millis() / 250) % 2 ? LED_BRIGHTNESS : 0;
+    if (!droneLinkUp() && idle) bl = millis() % 3000 < 100 ? LED_BRIGHTNESS : 0;
+    else if (!droneLinkUp()) bl = (millis() / 250) % 2 ? LED_BRIGHTNESS : 0;
     else if (b < 0) bl = LED_BRIGHTNESS;
     else batteryColor(b, r, g);
     uint32_t c = r << 16 | g << 8 | bl;
@@ -77,5 +82,12 @@ static void ledTask(void*) {
   }
 }
 
+void ledSetIdle(bool on) { idle = on; }
+
 // Priority 1, below the loop (2).
 void ledBegin() { xTaskCreate(ledTask, "led", 2048, nullptr, 1, nullptr); }
+#else
+void ledBegin() {}
+void ledSetIdle(bool) {}
+void ledFlash(uint8_t, uint8_t, uint8_t, int) {}
+#endif

@@ -28,6 +28,7 @@ inline MenuParam menuParams[] = {
     {"Banked turn", PARAM_SELECT, "Off;On", 0, 1, &settings.bankedTurn},
     {"Cut-out", PARAM_SELECT, "Off;On", 0, 1, &settings.cutOut},
     {"Accessory", PARAM_SELECT, "None;Wheels;Truck;Hull;Hydrofoil", 0, 4, &settings.accessory},
+    {"WiFi update", PARAM_SELECT, "Off;On", 0, 1, &wifiUpdateRequest},
     {"Firmware", PARAM_INFO, "rc2parrot", 0, 0, nullptr},
 };
 constexpr uint8_t kMenuCount = sizeof(menuParams) / sizeof(menuParams[0]);

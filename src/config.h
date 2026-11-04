@@ -32,6 +32,10 @@ constexpr int PPM_PIN = 4;   // PPM from the radio trainer port
 constexpr int CRSF_PIN = 4;     // CRSF from the radio TX2 pad (UART1 RX)
 constexpr int CRSF_TX_PIN = 3;  // CRSF telemetry to the radio PA15 pad (UART1 TX)
 constexpr int LED_PIN = 5;  // RGBW NeoPixel (SK6812)
+// 0 = build without the status LED: no LED task, GPIO5 stays free. The *_noled environments set it.
+#ifndef USE_LED
+#define USE_LED 1
+#endif
 
 // ---------- Radio channels (index 0 = CH1) ----------
 constexpr int CH_ROLL = 0, CH_PITCH = 1, CH_GAZ = 2, CH_YAW = 3;  // AETR
@@ -59,6 +63,9 @@ constexpr uint8_t DEFAULT_ACCESSORY = 3;             // 0 none, 1 wheels, 2 truc
 
 // ---------- Timing ----------
 constexpr uint32_t RC_TIMEOUT_MS = 300;  // no radio frame for this long = failsafe landing
+// No radio frame for this long (radio off, or on another model): stop the drone scan and disconnect
+// a landed drone, so the BLE radio stays quiet. Bench builds (FORCE_CONSOLE) keep scanning.
+constexpr uint32_t RADIO_IDLE_MS = 10000;
 // One PCMD per period, with the newest radio frame. The Parrot app sends at 50 ms. Sending on every
 // PPM frame (~44 Hz) made the drone lag behind the sticks.
 constexpr uint32_t PCMD_PERIOD_MS = 50;
@@ -67,6 +74,10 @@ constexpr uint32_t AUTO_TRIM_WAIT_MS = 3000;  // time for the drone to report th
 
 // ---------- Console ----------
 constexpr uint32_t CONSOLE_DISCARD_MS = 500;  // input discarded after the serial port turns back on
+
+// ---------- WiFi update (radio menu "WiFi update") ----------
+#define WIFI_AP_SSID "rc2parrot"
+#define WIFI_AP_PASSWORD "rc2parrot"  // WiFi and OTA password; at least 8 characters
 
 // ---------- BLE ----------
 constexpr int8_t BLE_TX_DBM = 21;          // ESP32-C3 maximum

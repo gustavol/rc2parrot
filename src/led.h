@@ -5,4 +5,5 @@
 #include <stdint.h>
 
 void ledBegin();
+void ledSetIdle(bool idle);  // radio idle: one short blink every 3 s instead of the search blink
 void ledFlash(uint8_t r, uint8_t g, uint8_t b, int times);  // flashes over the normal color

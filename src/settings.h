@@ -22,6 +22,9 @@ inline Settings settings = {SETTINGS_VERSION,  DEFAULT_MAX_TILT_DEG, DEFAULT_MAX
                             DEFAULT_MAX_VERT_SPEED_CMS, DEFAULT_MAX_ROT_SPEED_DPS,
                             DEFAULT_BANKED_TURN, DEFAULT_CUT_OUT, DEFAULT_ACCESSORY};
 
+// Radio menu "WiFi update" (0 off, 1 on). Not saved: off after every reboot. See ota.h.
+inline uint8_t wifiUpdateRequest = 0;
+
 // Set by the radio menu (UART task). The loop saves the settings and sends them to the drone.
 inline volatile bool settingsChanged = false;
 

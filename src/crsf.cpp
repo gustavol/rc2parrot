@@ -7,6 +7,7 @@
 #include "crsf_menu.h"
 #include "drone.h"
 #include "log.h"
+#include "ota.h"
 #include "rc.h"
 
 static HardwareSerial uart(1);
@@ -40,7 +41,8 @@ static void sendTelemetry() {
     uart.write(f, crsfFrame(f, 0x08, bat, sizeof bat));
   }
 
-  const char* state = up ? droneStateName() : "no drone";  // FLIGHT_MODE 0x21, max 13 characters
+  // FLIGHT_MODE 0x21, max 13 characters
+  const char* state = otaActive() ? "wifi update" : up ? droneStateName() : "no drone";
   uart.write(f, crsfFrame(f, 0x21, (const uint8_t*)state, strlen(state) + 1));
 }
 

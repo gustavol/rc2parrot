@@ -17,6 +17,8 @@ void droneBegin();
 bool droneConnect();
 
 bool droneLinkUp();  // safe from any task
+bool droneLanded();  // the drone reports that it is landed; safe from any task
+void droneDisconnect();
 int droneBattery();  // percent; -1 = unknown
 
 void droneCommand(DroneCmd cmd);
